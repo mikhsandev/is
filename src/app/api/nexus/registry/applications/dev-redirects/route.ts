@@ -7,6 +7,7 @@ import { hasTrustedOrigin } from '@/lib/admin-access';
 import { reply } from '@/lib/nexus-response';
 import { parseBody } from '@/lib/nexus-registry';
 import { validateDevHttpUri } from '@/lib/dev-redirect-policy.mjs';
+import { planLegacyRedirectMigration } from '@/lib/legacy-redirect-migration.mjs';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -19,7 +20,8 @@ export async function GET(req:NextRequest) {
   try {
     if (!await currentNexusOperatorId(req.headers)) return reply({error:'forbidden'},403);
     const rows=await pool.query(`SELECT o.oauth_client_id,o.application_id,o.environment,a.name AS application_name,
-      COALESCE(c.enabled,false) AS enabled,
+      COALESCE(c.enabled,false) AS enabled, o.redirect_uris AS base_redirects,
+      (c.oauth_client_id IS NOT NULL) AS capability_configured,
       COALESCE((SELECT json_agg(r.redirect_uri ORDER BY r.redirect_uri) FROM nexus_oauth_dev_redirects r
         WHERE r.oauth_client_id=o.oauth_client_id),'[]'::json) AS http_redirects
       FROM nexus_application_oauth_clients o
@@ -35,11 +37,11 @@ export async function POST(req:NextRequest) {
   const actor=await currentNexusOperatorId(req.headers);
   if(!actor) return reply({error:'forbidden'},403);
   const b=parseBody(await req.json().catch(()=>null));
-  if(!b || !isId(b.clientId) || !['enable','disable','add','remove'].includes(String(b.action))) return reply({error:'invalid_body'},400);
-  const clientId=b.clientId, action=b.action as 'enable'|'disable'|'add'|'remove';
+  if(!b || !isId(b.clientId) || !['enable','disable','add','remove','migrate_legacy'].includes(String(b.action))) return reply({error:'invalid_body'},400);
+  const clientId=b.clientId, action=b.action as 'enable'|'disable'|'add'|'remove'|'migrate_legacy';
   const uri = action==='add'||action==='remove' ? validateDevHttpUri(b.uri) : null;
   if((action==='add'||action==='remove')&&!uri) return reply({error:'invalid_private_http_uri'},400);
-  if(action==='enable' && b.confirmInsecureDev !== true) return reply({error:'explicit_confirmation_required'},400);
+  if((action==='enable' || action==='migrate_legacy') && b.confirmInsecureDev !== true) return reply({error:'explicit_confirmation_required'},400);
   const db=await pool.connect();
   try {
     await db.query('BEGIN');
@@ -54,6 +56,54 @@ export async function POST(req:NextRequest) {
     }
     const appId=registry.rows[0].application_id;
     const existing=await db.query('SELECT marker_uri,enabled FROM nexus_oauth_dev_capabilities WHERE oauth_client_id=$1 FOR UPDATE',[clientId]);
+    if(action==='migrate_legacy'){
+      // One-time migration for pre-v0.8 development clients. Preserve OAuth client credentials.
+      // The provider update is an external operation, so we explicitly attempt compensation
+      // if the local transaction fails; neither store can be committed atomically with the other.
+      if(existing.rowCount){
+        await db.query('ROLLBACK');
+        return reply({error:'development_capability_already_exists'},409);
+      }
+      const oldUris = registry.rows[0].redirect_uris;
+      const plan = planLegacyRedirectMigration(oldUris,
+        typeof b.httpsBaseUri==='string' ? b.httpsBaseUri : '');
+      if(!plan.httpsUris || !plan.httpUris){
+        await db.query('ROLLBACK');return reply({error:plan.error ?? 'invalid_legacy_redirects'},409);
+      }
+      const marker = `${new URL(process.env.BETTER_AUTH_URL!).origin}/.well-known/is-dev-client/${randomUUID()}`;
+      const newUris = [...plan.httpsUris,marker];
+      let providerUpdated = false;
+      try {
+        // Update Better Auth using its supported administrative API, not direct OAuth-table SQL.
+        await auth.api.adminUpdateOAuthClient({headers:req.headers,
+          body:{client_id:clientId,update:{redirect_uris:newUris}}});
+        providerUpdated = true;
+        await db.query(`INSERT INTO nexus_oauth_dev_capabilities(oauth_client_id,marker_uri,enabled,changed_by)
+          VALUES($1,$2,true,$3)`,[clientId,marker,actor]);
+        for(const httpUri of plan.httpUris){
+          await db.query(`INSERT INTO nexus_oauth_dev_redirects(oauth_client_id,redirect_uri,created_by)
+            VALUES($1,$2,$3)`,[clientId,httpUri,actor]);
+        }
+        await db.query(`UPDATE nexus_application_oauth_clients SET redirect_uris=$2::jsonb
+          WHERE oauth_client_id=$1`,[clientId,JSON.stringify(plan.httpsUris)]);
+        await audit(db,actor,appId,{event:'legacy_dev_http_redirects_migrated',
+          client_id:clientId,http_redirects:plan.httpUris,https_redirects:plan.httpsUris});
+        await db.query('COMMIT');
+        return reply({success:true,migrated_http_redirects:plan.httpUris,
+          https_base_redirects:plan.httpsUris});
+      }catch(error){
+        await db.query('ROLLBACK').catch(()=>{});
+        if(providerUpdated){
+          try { await auth.api.adminUpdateOAuthClient({headers:req.headers,
+            body:{client_id:clientId,update:{redirect_uris:oldUris}}}); }
+          catch(recoveryError){
+            console.error('CRITICAL: OAuth client redirect reconciliation required',clientId,recoveryError);
+          }
+        }
+        console.error('Legacy OAuth redirect migration failed',clientId,error);
+        return reply({error:'legacy_migration_failed_check_server_logs'},500);
+      }
+    }
     if(action==='enable'){
       // Per-client unique HTTPS marker is registered with Better Auth, because its validator
       // receives registered URIs rather than a client ID. No LAN HTTP URI is registered there.
