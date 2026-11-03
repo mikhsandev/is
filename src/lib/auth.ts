@@ -3,7 +3,6 @@ import { jwt } from "better-auth/plugins";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { pool } from "@/lib/database";
 import { isEmailPermitted } from "@/lib/admission";
-import { validateOAuthRedirect } from "@/lib/dev-redirect-validator";
 
 const required = ["BETTER_AUTH_URL", "BETTER_AUTH_SECRET", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"] as const;
 for (const key of required) {
@@ -49,7 +48,6 @@ export const auth = betterAuth({
       consentPage: "/consent",
       allowDynamicClientRegistration: false,
       allowUnauthenticatedClientRegistration: false,
-      validateRedirectUri: validateOAuthRedirect,
       // Client provisioning is performed ONLY through a server-side admin command.
       clientPrivileges: async ({ user }) => {
         if (!user?.id) return false;

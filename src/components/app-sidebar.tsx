@@ -20,7 +20,6 @@ export function AppSidebar({displayName,canManageAdmissions,canManageNexus}:Prop
       </div>{expanded&&<div className="sidebar-submenu" id="nexus-menu">
         {child("/admin/nexus/operators","Manage Operators")}
         {child("/nexus/applications","Applications")}
-        {child("/nexus/applications/dev-redirects","Development Redirects")}
         {child("/nexus/tenants","Tenants")}
         {child("/nexus/entitlements","Entitlements")}
       </div>}</div>}
