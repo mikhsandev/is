@@ -14,7 +14,7 @@ function redirectUri(s:unknown):s is string {
     const u=new URL(s);
     if(u.hash || u.username || u.password)return false;
     if(u.protocol==="https:")return true;
-    return u.protocol==="http:"&&["localhost","127.0.0.1"].includes(u.hostname);
+    return false; // Development HTTP aliases must be approved separately, per client.
   } catch{return false;}
 }
 export async function GET(req:NextRequest){
