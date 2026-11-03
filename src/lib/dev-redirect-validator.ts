@@ -3,11 +3,11 @@ import { validateDevHttpUri, matchingRegistrationSet } from '@/lib/dev-redirect-
 
 /** Called by Better Auth at authorization time. No broad trusted origins. */
 export async function validateOAuthRedirect(uri: string, registeredUris: readonly string[], defaultResult: boolean): Promise<boolean> {
-  console.info("IS OAuth redirect validation", {
-    https: uri.startsWith("https://"),
+  console.info("IS OAuth redirect comparison", {
+    requested: uri,
+    registered: registeredUris,
+    exactMatch: registeredUris.includes(uri),
     defaultResult,
-    exactRegisteredMatch: registeredUris.includes(uri),
-    registeredCount: registeredUris.length,
   });
   if (uri.startsWith('https://')) return defaultResult;
   if (!validateDevHttpUri(uri)) return false;
